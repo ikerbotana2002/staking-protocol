@@ -255,4 +255,309 @@ contract StakingProtocolTest is Test {
         assertEq(smallToken.balanceOf(alice), 100 ether);
         assertEq(smallStaking.totalStaked(), 0);
     }
+
+    function testMultipleStakesAccumulateRewardsCorrectly() public {
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 200 ether);
+
+        // Día 1: 100 STK
+        staking.stake(100 ether);
+
+        vm.warp(block.timestamp + 1 days);
+
+        // Al hacer otro stake, primero se consolidan
+        // las rewards del primer día: 1 STK
+        staking.stake(100 ether);
+
+        assertEq(staking.rewards(alice), 1 ether);
+        assertEq(staking.stakedBalance(alice), 200 ether);
+
+        // Día 2: 200 STK
+        vm.warp(block.timestamp + 1 days);
+
+        staking.claimRewards();
+
+        vm.stopPrank();
+
+        // 1 STK del primer día
+        // + 2 STK del segundo día
+        // = 3 STK
+        assertEq(staking.rewards(alice), 0);
+
+        assertEq(token.balanceOf(alice), 803 ether);
+
+        assertEq(staking.stakedBalance(alice), 200 ether);
+    }
+
+    function testManualCompoundingIncreasesFutureRewards() public {
+        vm.startPrank(alice);
+
+        // Alice va a stakear en total:
+        // 100 + 1 reward + 100 = 201 STK
+        token.approve(address(staking), 201 ether);
+
+        // Día 1: stake inicial de 100
+        staking.stake(100 ether);
+
+        vm.warp(block.timestamp + 1 days);
+
+        // Ha generado 1 STK
+        staking.claimRewards();
+
+        assertEq(token.balanceOf(alice), 901 ether);
+        assertEq(staking.stakedBalance(alice), 100 ether);
+
+        // Compound manual:
+        // vuelve a stakear el 1 STK que acaba de cobrar
+        staking.stake(1 ether);
+
+        assertEq(staking.stakedBalance(alice), 101 ether);
+
+        // Además añade otros 100 STK
+        staking.stake(100 ether);
+
+        assertEq(staking.stakedBalance(alice), 201 ether);
+
+        // Segundo día con 201 STK
+        vm.warp(block.timestamp + 1 days);
+
+        staking.claimRewards();
+
+        vm.stopPrank();
+
+        // 201 STK durante 1 día:
+        // 201 / 100 = 2.01 STK
+        assertEq(token.balanceOf(alice), 802 ether + (1 ether / 100));
+
+        assertEq(staking.stakedBalance(alice), 201 ether);
+    }
+
+    function testMultiplePartialUnstakesKeepRewardAccountingCorrect() public {
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 100 ether);
+        staking.stake(100 ether);
+
+        // Día 1 con 100 STK
+        vm.warp(block.timestamp + 1 days);
+
+        // Retira 40
+        // Antes de bajar el stake se consolidan 1 STK de reward
+        staking.unstake(40 ether);
+
+        assertEq(staking.stakedBalance(alice), 60 ether);
+        assertEq(staking.rewards(alice), 1 ether);
+
+        // Día 2 con 60 STK
+        vm.warp(block.timestamp + 1 days);
+
+        // Retira otros 20
+        // Se consolidan 0.6 STK más
+        staking.unstake(20 ether);
+
+        assertEq(staking.stakedBalance(alice), 40 ether);
+        assertEq(staking.rewards(alice), 1 ether + (6 ether / 10));
+
+        // Día 3 con 40 STK
+        vm.warp(block.timestamp + 1 days);
+
+        staking.claimRewards();
+
+        vm.stopPrank();
+
+        // Rewards:
+        // día 1: 100 STK -> 1
+        // día 2:  60 STK -> 0.6
+        // día 3:  40 STK -> 0.4
+        // total = 2 STK
+
+        assertEq(staking.rewards(alice), 0);
+        assertEq(staking.stakedBalance(alice), 40 ether);
+
+        // Wallet:
+        // 1000
+        // -100 stake
+        // +40 unstake
+        // +20 unstake
+        // +2 rewards
+        // = 962
+        assertEq(token.balanceOf(alice), 962 ether);
+    }
+
+    function testOwnerCanChangeRewardRate() public {
+        staking.setRewardRate(200);
+
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 100 ether);
+        staking.stake(100 ether);
+
+        vm.warp(block.timestamp + 1 days);
+
+        staking.claimRewards();
+
+        vm.stopPrank();
+
+        // 2% de 100 STK = 2 STK
+        assertEq(token.balanceOf(alice), 902 ether);
+    }
+
+    function testNonOwnerCannotChangeRewardRate() public {
+        vm.prank(alice);
+
+        vm.expectRevert();
+        staking.setRewardRate(200);
+    }
+
+    function testRewardRateChangeDoesNotApplyRetroactively() public {
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 100 ether);
+        staking.stake(100 ether);
+
+        vm.stopPrank();
+
+        // 12 horas al 1%
+        vm.warp(block.timestamp + 12 hours);
+
+        // El owner cambia la tasa al 2%
+        staking.setRewardRate(200);
+
+        // Otras 12 horas al 2%
+        vm.warp(block.timestamp + 12 hours);
+
+        vm.prank(alice);
+        staking.claimRewards();
+
+        // Primeras 12h:
+        // 100 * 1% * 0.5 días = 0.5 STK
+
+        // Segundas 12h:
+        // 100 * 2% * 0.5 días = 1 STK
+
+        // Total reward = 1.5 STK
+
+        assertEq(token.balanceOf(alice), 900 ether + (15 ether / 10));
+
+        assertEq(staking.rewards(alice), 0);
+    }
+
+    function testAddingStakeUpdatesUserRewardCheckpoint() public {
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 200 ether);
+
+        // Alice entra con 100 STK
+        staking.stake(100 ether);
+
+        // 1 día al 1%
+        vm.warp(block.timestamp + 1 days);
+
+        // Añade otros 100.
+        // Antes de añadirlos, se contabiliza lo generado
+        // por los 100 antiguos.
+        staking.stake(100 ether);
+
+        vm.stopPrank();
+
+        // Los primeros 100 han generado 1 STK
+        assertEq(staking.rewards(alice), 1 ether);
+
+        // Ahora Alice tiene 200 STK
+        assertEq(staking.stakedBalance(alice), 200 ether);
+
+        // Tras 1 día al 1%, el índice global ha avanzado 0.01
+        assertEq(staking.userRewardPerTokenPaid(alice), 1 ether / 100);
+
+        // Otro día con los 200 STK
+        vm.warp(block.timestamp + 1 days);
+
+        vm.prank(alice);
+        staking.claimRewards();
+
+        // Primer día: 100 STK -> 1
+        // Segundo día: 200 STK -> 2
+        // Total: 3 STK
+        assertEq(token.balanceOf(alice), 803 ether);
+
+        // El marcador personal ahora queda actualizado
+        // al índice global de 0.02
+        assertEq(staking.userRewardPerTokenPaid(alice), 2 ether / 100);
+    }
+
+    function testRemovingStakeUpdatesUserRewardCheckpoint() public {
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 200 ether);
+        staking.stake(200 ether);
+
+        // Día 1 con 200 STK
+        vm.warp(block.timestamp + 1 days);
+
+        // Antes de retirar, se contabiliza todo el tramo
+        // en el que Alice tuvo 200 STK.
+        staking.unstake(100 ether);
+
+        vm.stopPrank();
+
+        assertEq(staking.rewards(alice), 2 ether);
+        assertEq(staking.stakedBalance(alice), 100 ether);
+
+        // El índice global está en 0.01
+        // y Alice ya tiene contabilizado hasta ahí.
+        assertEq(staking.userRewardPerTokenPaid(alice), 1 ether / 100);
+
+        // Otro día, ahora solo con 100 STK
+        vm.warp(block.timestamp + 1 days);
+
+        vm.prank(alice);
+        staking.claimRewards();
+
+        // Día 1: 200 STK -> 2 STK
+        // Día 2: 100 STK -> 1 STK
+        // Total rewards = 3 STK
+
+        // Wallet:
+        // 1000 - 200 stake + 100 unstake + 3 rewards
+        // = 903
+        assertEq(token.balanceOf(alice), 903 ether);
+
+        assertEq(staking.stakedBalance(alice), 100 ether);
+
+        // Índice global tras 2 días = 0.02
+        assertEq(staking.userRewardPerTokenPaid(alice), 2 ether / 100);
+    }
+
+    function testFundRewardPool() public {
+        uint256 initialPool = staking.rewardPoolBalance();
+
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 500 ether);
+        staking.fundRewardPool(500 ether);
+
+        vm.stopPrank();
+
+        assertEq(staking.rewardPoolBalance(), initialPool + 500 ether);
+    }
+
+    function testOwnerCanWithdrawUnusedRewardsWithoutTouchingStake() public {
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 100 ether);
+        staking.stake(100 ether);
+
+        vm.stopPrank();
+
+        uint256 ownerBalanceBefore = token.balanceOf(address(this));
+
+        staking.withdrawUnusedRewards(1_000 ether);
+
+        assertEq(token.balanceOf(address(this)), ownerBalanceBefore + 1_000 ether);
+
+        assertEq(staking.totalStaked(), 100 ether);
+
+        assertEq(token.balanceOf(address(staking)), 9_100 ether);
+    }
 }
