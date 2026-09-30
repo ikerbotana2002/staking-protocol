@@ -6,8 +6,9 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
-contract StakingProtocol is Ownable, ReentrancyGuard, Pausable {
+contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     IERC20 public immutable stakingToken;
@@ -38,6 +39,7 @@ contract StakingProtocol is Ownable, ReentrancyGuard, Pausable {
     event UnusedRewardsWithdrawn(address indexed owner, uint256 amount);
 
     constructor(address tokenAddress) Ownable(msg.sender) {
+        require(tokenAddress != address(0), "Invalid token address");
         stakingToken = IERC20(tokenAddress);
         lastGlobalUpdateTime = block.timestamp;
     }

@@ -631,4 +631,52 @@ contract StakingProtocolTest is Test {
 
         assertEq(staking.totalRewardLiability(), 0);
     }
+
+    function testOwnershipTransferRequiresAcceptance() public {
+        staking.transferOwnership(alice);
+
+        // Todavía seguimos siendo owner.
+        assertEq(staking.owner(), address(this));
+
+        // Alice solo es pendingOwner.
+        assertEq(staking.pendingOwner(), alice);
+
+        vm.prank(alice);
+        staking.acceptOwnership();
+
+        assertEq(staking.owner(), alice);
+    }
+
+    function testWrongUserCannotAcceptOwnership() public {
+        staking.transferOwnership(alice);
+
+        vm.prank(bob);
+        vm.expectRevert();
+        staking.acceptOwnership();
+
+        assertEq(staking.owner(), address(this));
+    }
+
+    function testCannotDeployWithZeroTokenAddress() public {
+        vm.expectRevert("Invalid token address");
+
+        new StakingProtocol(address(0));
+    }
+
+    function testCannotClaimWhilePaused() public {
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 100 ether);
+        staking.stake(100 ether);
+
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 1 days);
+
+        staking.pause();
+
+        vm.prank(alice);
+        vm.expectRevert();
+        staking.claimRewards();
+    }
 }
