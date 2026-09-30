@@ -4,16 +4,16 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
-contract StakingProtocol is Ownable {
+contract StakingProtocol is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     IERC20 public immutable stakingToken;
 
     mapping(address => uint256) public stakedBalance;
     mapping(address => uint256) public rewards;
-
-    // Último rewardPerToken que ya se contabilizó para cada usuario
     mapping(address => uint256) public userRewardPerTokenPaid;
 
     uint256 public totalStaked;
@@ -21,12 +21,11 @@ contract StakingProtocol is Ownable {
     // 100 BPS = 1% diario
     uint256 public rewardRateBps = 100;
 
-    // Acumulador global.
-    // Usamos 1e18 para mantener precisión decimal.
     uint256 public rewardPerTokenStored;
-
-    // Última vez que actualizamos el acumulador global
     uint256 public lastGlobalUpdateTime;
+
+    // Rewards generadas globalmente y todavía no pagadas.
+    uint256 public totalRewardLiability;
 
     event Staked(address indexed user, uint256 amount);
     event Unstaked(address indexed user, uint256 amount);
@@ -43,7 +42,15 @@ contract StakingProtocol is Ownable {
         lastGlobalUpdateTime = block.timestamp;
     }
 
-    function stake(uint256 amount) external {
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Amount must be greater than 0");
 
         _updateReward(msg.sender);
@@ -56,7 +63,7 @@ contract StakingProtocol is Ownable {
         emit Staked(msg.sender, amount);
     }
 
-    function unstake(uint256 amount) external {
+    function unstake(uint256 amount) external nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
 
         require(stakedBalance[msg.sender] >= amount, "Insufficient staked balance");
@@ -71,16 +78,21 @@ contract StakingProtocol is Ownable {
         emit Unstaked(msg.sender, amount);
     }
 
-    function claimRewards() external {
+    function claimRewards() external nonReentrant whenNotPaused {
         _updateReward(msg.sender);
 
         uint256 reward = rewards[msg.sender];
 
         require(reward > 0, "No rewards");
 
+        // Aquí usamos el pool FÍSICO, porque estas rewards
+        // ya forman parte de las liabilities.
         require(reward <= rewardPoolBalance(), "Insufficient reward pool");
 
         rewards[msg.sender] = 0;
+
+        // Dejamos de deber estas rewards porque ya las pagamos.
+        totalRewardLiability -= reward;
 
         stakingToken.safeTransfer(msg.sender, reward);
 
@@ -107,6 +119,8 @@ contract StakingProtocol is Ownable {
         return rewards[user] + newRewards;
     }
 
+    // Rewards físicamente presentes:
+    // balance del contrato - principal de usuarios.
     function rewardPoolBalance() public view returns (uint256) {
         uint256 contractBalance = stakingToken.balanceOf(address(this));
 
@@ -117,7 +131,35 @@ contract StakingProtocol is Ownable {
         return contractBalance - totalStaked;
     }
 
-    function fundRewardPool(uint256 amount) external {
+    // Deuda total actual, incluyendo lo generado
+    // desde la última actualización global.
+    function currentRewardLiability() public view returns (uint256) {
+        if (totalStaked == 0) {
+            return totalRewardLiability;
+        }
+
+        uint256 currentRewardPerToken = rewardPerToken();
+
+        uint256 difference = currentRewardPerToken - rewardPerTokenStored;
+
+        uint256 pendingGlobalRewards = (totalStaked * difference) / 1e18;
+
+        return totalRewardLiability + pendingGlobalRewards;
+    }
+
+    // Rewards realmente libres para el owner.
+    function withdrawableRewards() public view returns (uint256) {
+        uint256 pool = rewardPoolBalance();
+        uint256 liability = currentRewardLiability();
+
+        if (pool <= liability) {
+            return 0;
+        }
+
+        return pool - liability;
+    }
+
+    function fundRewardPool(uint256 amount) external nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
 
         stakingToken.safeTransferFrom(msg.sender, address(this), amount);
@@ -125,10 +167,14 @@ contract StakingProtocol is Ownable {
         emit RewardPoolFunded(msg.sender, amount);
     }
 
-    function withdrawUnusedRewards(uint256 amount) external onlyOwner {
+    function withdrawUnusedRewards(uint256 amount) external onlyOwner nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
 
-        require(amount <= rewardPoolBalance(), "Insufficient reward pool");
+        // Consolidamos primero todas las rewards
+        // generadas hasta este instante.
+        _updateGlobalReward();
+
+        require(amount <= withdrawableRewards(), "Rewards already owed to users");
 
         stakingToken.safeTransfer(owner(), amount);
 
@@ -138,8 +184,6 @@ contract StakingProtocol is Ownable {
     function setRewardRate(uint256 newRateBps) external onlyOwner {
         require(newRateBps <= 10_000, "Reward rate too high");
 
-        // Consolidamos el periodo anterior
-        // usando la tasa antigua.
         _updateGlobalReward();
 
         uint256 oldRate = rewardRateBps;
@@ -149,7 +193,18 @@ contract StakingProtocol is Ownable {
     }
 
     function _updateGlobalReward() internal {
-        rewardPerTokenStored = rewardPerToken();
+        uint256 newRewardPerToken = rewardPerToken();
+
+        uint256 difference = newRewardPerToken - rewardPerTokenStored;
+
+        if (totalStaked > 0) {
+            uint256 newGlobalRewards = (totalStaked * difference) / 1e18;
+
+            totalRewardLiability += newGlobalRewards;
+        }
+
+        rewardPerTokenStored = newRewardPerToken;
+
         lastGlobalUpdateTime = block.timestamp;
     }
 

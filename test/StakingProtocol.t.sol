@@ -560,4 +560,75 @@ contract StakingProtocolTest is Test {
 
         assertEq(token.balanceOf(address(staking)), 9_100 ether);
     }
+
+    function testOwnerCanPauseProtocol() public {
+        staking.pause();
+
+        assertTrue(staking.paused());
+    }
+
+    function testCannotStakeWhilePaused() public {
+        staking.pause();
+
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 100 ether);
+
+        vm.expectRevert();
+        staking.stake(100 ether);
+
+        vm.stopPrank();
+    }
+
+    function testCanUnstakeWhilePaused() public {
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 100 ether);
+        staking.stake(100 ether);
+
+        vm.stopPrank();
+
+        staking.pause();
+
+        vm.prank(alice);
+        staking.unstake(100 ether);
+
+        assertEq(staking.stakedBalance(alice), 0);
+        assertEq(token.balanceOf(alice), 1_000 ether);
+    }
+
+    function testOwnerCannotWithdrawRewardsAlreadyOwedToUsers() public {
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 100 ether);
+        staking.stake(100 ether);
+
+        vm.stopPrank();
+
+        // 100 STK durante 100 días al 1% diario
+        // = 100 STK de rewards
+        vm.warp(block.timestamp + 100 days);
+
+        assertEq(staking.currentRewardLiability(), 100 ether);
+
+        assertEq(staking.rewardPoolBalance(), 10_000 ether);
+
+        assertEq(staking.withdrawableRewards(), 9_900 ether);
+
+        // El owner intenta retirar también los 100
+        // que ya pertenecen económicamente a Alice.
+        vm.expectRevert("Rewards already owed to users");
+        staking.withdrawUnusedRewards(10_000 ether);
+
+        // Solo puede retirar lo realmente libre.
+        staking.withdrawUnusedRewards(9_900 ether);
+
+        // Alice todavía puede cobrar sus 100.
+        vm.prank(alice);
+        staking.claimRewards();
+
+        assertEq(token.balanceOf(alice), 1_000 ether);
+
+        assertEq(staking.totalRewardLiability(), 0);
+    }
 }
