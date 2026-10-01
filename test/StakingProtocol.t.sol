@@ -740,4 +740,32 @@ contract StakingProtocolTest is Test {
 
         assertEq(staking.stakedBalance(alice), stakeAmount - unstakeAmount);
     }
+
+    function testOwnerCanUnpauseProtocol() public {
+        staking.pause();
+
+        assertTrue(staking.paused());
+
+        staking.unpause();
+
+        assertFalse(staking.paused());
+    }
+
+    function testRewardPerTokenIncreasesOverTime() public {
+        vm.startPrank(alice);
+
+        token.approve(address(staking), 100 ether);
+        staking.stake(100 ether);
+
+        vm.stopPrank();
+
+        uint256 initialRewardPerToken = staking.rewardPerToken();
+
+        vm.warp(block.timestamp + 1 days);
+
+        uint256 rewardPerTokenAfterOneDay = staking.rewardPerToken();
+
+        // 1% diario = 0.01 STK por cada STK stakeado
+        assertEq(rewardPerTokenAfterOneDay - initialRewardPerToken, 1 ether / 100);
+    }
 }
