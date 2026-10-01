@@ -4,9 +4,9 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -22,14 +22,23 @@ contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
     // 100 BPS = 1% diario
     uint256 public rewardRateBps = 100;
 
+    // Índice global de rewards por token.
     uint256 public rewardPerTokenStored;
+
+    // Último momento en el que consolidamos el índice global.
     uint256 public lastGlobalUpdateTime;
 
     // Rewards generadas globalmente y todavía no pagadas.
     uint256 public totalRewardLiability;
 
+    // Resto de precisión que no llega todavía a formar
+    // una unidad mínima completa de reward.
+    uint256 public rewardLiabilityRemainder;
+
     event Staked(address indexed user, uint256 amount);
+
     event Unstaked(address indexed user, uint256 amount);
+
     event RewardsClaimed(address indexed user, uint256 amount);
 
     event RewardRateUpdated(uint256 oldRateBps, uint256 newRateBps);
@@ -40,6 +49,7 @@ contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
 
     constructor(address tokenAddress) Ownable(msg.sender) {
         require(tokenAddress != address(0), "Invalid token address");
+
         stakingToken = IERC20(tokenAddress);
         lastGlobalUpdateTime = block.timestamp;
     }
@@ -87,13 +97,11 @@ contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
 
         require(reward > 0, "No rewards");
 
-        // Aquí usamos el pool FÍSICO, porque estas rewards
-        // ya forman parte de las liabilities.
         require(reward <= rewardPoolBalance(), "Insufficient reward pool");
 
         rewards[msg.sender] = 0;
 
-        // Dejamos de deber estas rewards porque ya las pagamos.
+        // Ya hemos pagado esta deuda.
         totalRewardLiability -= reward;
 
         stakingToken.safeTransfer(msg.sender, reward);
@@ -121,8 +129,8 @@ contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
         return rewards[user] + newRewards;
     }
 
-    // Rewards físicamente presentes:
-    // balance del contrato - principal de usuarios.
+    // Tokens físicamente disponibles para rewards.
+    // No incluye el principal stakeado.
     function rewardPoolBalance() public view returns (uint256) {
         uint256 contractBalance = stakingToken.balanceOf(address(this));
 
@@ -133,25 +141,18 @@ contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
         return contractBalance - totalStaked;
     }
 
-    // Deuda total actual, incluyendo lo generado
+    // Deuda actual incluyendo rewards generadas
     // desde la última actualización global.
     function currentRewardLiability() public view returns (uint256) {
-        if (totalStaked == 0) {
-            return totalRewardLiability;
-        }
+        (uint256 pendingRewards,) = _pendingGlobalLiability();
 
-        uint256 currentRewardPerToken = rewardPerToken();
-
-        uint256 difference = currentRewardPerToken - rewardPerTokenStored;
-
-        uint256 pendingGlobalRewards = (totalStaked * difference) / 1e18;
-
-        return totalRewardLiability + pendingGlobalRewards;
+        return totalRewardLiability + pendingRewards;
     }
 
-    // Rewards realmente libres para el owner.
+    // Rewards que realmente puede retirar el owner.
     function withdrawableRewards() public view returns (uint256) {
         uint256 pool = rewardPoolBalance();
+
         uint256 liability = currentRewardLiability();
 
         if (pool <= liability) {
@@ -172,8 +173,8 @@ contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
     function withdrawUnusedRewards(uint256 amount) external onlyOwner nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
 
-        // Consolidamos primero todas las rewards
-        // generadas hasta este instante.
+        // Primero consolidamos toda la deuda
+        // generada hasta este instante.
         _updateGlobalReward();
 
         require(amount <= withdrawableRewards(), "Rewards already owed to users");
@@ -186,9 +187,11 @@ contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
     function setRewardRate(uint256 newRateBps) external onlyOwner {
         require(newRateBps <= 10_000, "Reward rate too high");
 
+        // Cerramos el tramo con la tasa antigua.
         _updateGlobalReward();
 
         uint256 oldRate = rewardRateBps;
+
         rewardRateBps = newRateBps;
 
         emit RewardRateUpdated(oldRate, newRateBps);
@@ -197,13 +200,11 @@ contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
     function _updateGlobalReward() internal {
         uint256 newRewardPerToken = rewardPerToken();
 
-        uint256 difference = newRewardPerToken - rewardPerTokenStored;
+        (uint256 newGlobalRewards, uint256 newRemainder) = _pendingGlobalLiability();
 
-        if (totalStaked > 0) {
-            uint256 newGlobalRewards = (totalStaked * difference) / 1e18;
+        totalRewardLiability += newGlobalRewards;
 
-            totalRewardLiability += newGlobalRewards;
-        }
+        rewardLiabilityRemainder = newRemainder;
 
         rewardPerTokenStored = newRewardPerToken;
 
@@ -220,5 +221,21 @@ contract StakingProtocol is Ownable2Step, ReentrancyGuard, Pausable {
         rewards[user] += newRewards;
 
         userRewardPerTokenPaid[user] = rewardPerTokenStored;
+    }
+
+    function _pendingGlobalLiability() internal view returns (uint256 pendingRewards, uint256 newRemainder) {
+        if (totalStaked == 0) {
+            return (0, rewardLiabilityRemainder);
+        }
+
+        uint256 timeElapsed = block.timestamp - lastGlobalUpdateTime;
+
+        uint256 denominator = 10_000 * 1 days;
+
+        uint256 numerator = (totalStaked * timeElapsed * rewardRateBps) + rewardLiabilityRemainder;
+
+        pendingRewards = numerator / denominator;
+
+        newRemainder = numerator % denominator;
     }
 }

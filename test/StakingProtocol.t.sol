@@ -679,4 +679,65 @@ contract StakingProtocolTest is Test {
         vm.expectRevert();
         staking.claimRewards();
     }
+
+    function testFuzzStake(uint256 amount) public {
+        amount = bound(amount, 1, 1_000 ether);
+
+        vm.startPrank(alice);
+
+        token.approve(address(staking), amount);
+        staking.stake(amount);
+
+        vm.stopPrank();
+
+        assertEq(staking.stakedBalance(alice), amount);
+
+        assertEq(staking.totalStaked(), amount);
+
+        assertEq(token.balanceOf(alice), 1_000 ether - amount);
+    }
+
+    function testFuzzEarnedRewards(uint256 amount, uint256 numDays) public {
+        amount = bound(amount, 1 ether, 1_000 ether);
+        numDays = bound(numDays, 1, 365);
+
+        vm.startPrank(alice);
+
+        token.approve(address(staking), amount);
+        staking.stake(amount);
+
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + (numDays * 1 days));
+
+        uint256 expectedReward = (amount * numDays) / 100;
+
+        assertEq(staking.earned(alice), expectedReward);
+    }
+
+    function testFuzzPartialUnstakeKeepsRewards(uint256 stakeAmount, uint256 unstakeAmount, uint256 numDays) public {
+        stakeAmount = bound(stakeAmount, 1 ether, 1_000 ether);
+
+        unstakeAmount = bound(unstakeAmount, 1 ether, stakeAmount);
+
+        numDays = bound(numDays, 1, 365);
+
+        vm.startPrank(alice);
+
+        token.approve(address(staking), stakeAmount);
+
+        staking.stake(stakeAmount);
+
+        vm.warp(block.timestamp + (numDays * 1 days));
+
+        staking.unstake(unstakeAmount);
+
+        vm.stopPrank();
+
+        uint256 expectedReward = (stakeAmount * numDays) / 100;
+
+        assertEq(staking.rewards(alice), expectedReward);
+
+        assertEq(staking.stakedBalance(alice), stakeAmount - unstakeAmount);
+    }
 }
